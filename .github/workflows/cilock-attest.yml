@@ -59,7 +59,8 @@ jobs:
 
       # Step 2: attest the BUILD. `goreleaser build --snapshot` compiles the real release
       # binaries (console + kc-agent) without publishing, so it is safe on a fork/tag.
-      # --trace makes the build hermetic and records materials/products (the SLSA-L3 signal).
+      # No --trace: hermetic kernel tracing needs CAP_SYS_ADMIN, which GitHub-hosted runners
+      # do not grant (curl/hugo omit it too). command-run still records argv/exit/stdout.
       - name: Attest build (step=build)
         run: |
           go install github.com/goreleaser/goreleaser/v2@latest
@@ -67,7 +68,6 @@ jobs:
             -a environment,git,github,slsa \
             -o build.att.json \
             --platform-url "${PLATFORM_URL}" --enable-archivista \
-            --trace --hardening standard \
             -- bash -c 'goreleaser build --snapshot --clean'
 
       # Step 3 (optional, uncomment once the image build runs here): attest the container image.
