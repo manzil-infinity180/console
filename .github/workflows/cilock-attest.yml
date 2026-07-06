@@ -1,0 +1,111 @@
+name: cilock-attest
+
+# Signs and attests the console + kc-agent build with cilock, keyless, against the
+# TestifySec platform (no long-lived secrets). Source: docs/supply-chain/cilock.md.
+#
+# One-time setup by a tenant admin (see the doc): `cilock trust github <org>/<repo>`
+# federates this repo's GitHub Actions OIDC identity to the tenant, so `id-token: write`
+# below is the only thing the workflow needs to sign keyless.
+#
+# Fork-safe by design: PLATFORM_URL defaults to the staging platform, so running this on
+# a fork never touches prod. Point it at prod only for the real upstream release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # REQUIRED: ambient GitHub OIDC -> platform Fulcio (keyless signing)
+  contents: read
+
+env:
+  CILOCK_VERSION: "3.0.0"
+  # Staging by default (fork-safe). Override in repo/org Actions vars for the real release.
+  PLATFORM_URL: ${{ vars.PLATFORM_URL || 'https://platform.aws-sandbox-staging.testifysec.dev' }}
+
+jobs:
+  attest-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # goreleaser + the git attestor want full history/tags
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Install a pinned, checksum-verified cilock. Never `curl | bash`.
+      - name: Install cilock (pinned + checksum-verified)
+        run: |
+          base="https://cilock.dev/dl/v${CILOCK_VERSION}"
+          curl -fsSLO "${base}/cilock-${CILOCK_VERSION}-linux-amd64.tar.gz"
+          curl -fsSLO "${base}/cilock-${CILOCK_VERSION}-linux-amd64.tar.gz.sha256"
+          sha256sum -c "cilock-${CILOCK_VERSION}-linux-amd64.tar.gz.sha256"
+          tar -xzf "cilock-${CILOCK_VERSION}-linux-amd64.tar.gz"
+          sudo install cilock /usr/local/bin/cilock
+          cilock version
+
+      # Step 1: attest the SOURCE (commit + CI context). The attestation IS the artifact,
+      # so we wrap a no-op. Signs keyless via the workflow OIDC identity, uploads to Archivista.
+      - name: Attest source (step=source-git)
+        run: |
+          cilock run --step source-git \
+            -a git,github,environment \
+            -o source-git.att.json \
+            --platform-url "${PLATFORM_URL}" --enable-archivista \
+            -- git rev-parse HEAD
+
+      # Step 2: attest the BUILD. `goreleaser build --snapshot` compiles the real release
+      # binaries (console + kc-agent) without publishing, so it is safe on a fork/tag.
+      # --trace makes the build hermetic and records materials/products (the SLSA-L3 signal).
+      - name: Attest build (step=build)
+        run: |
+          go install github.com/goreleaser/goreleaser/v2@latest
+          cilock run --step build \
+            -a environment,git,github,slsa \
+            -o build.att.json \
+            --platform-url "${PLATFORM_URL}" --enable-archivista \
+            --trace --hardening standard \
+            -- bash -c 'goreleaser build --snapshot --clean'
+
+      # Step 3 (optional, uncomment once the image build runs here): attest the container image.
+      # - name: Attest image (step=image)
+      #   run: |
+      #     cilock run --step image -a environment,git,oci \
+      #       -o image.att.json --platform-url "${PLATFORM_URL}" --enable-archivista \
+      #       -- docker buildx build --load -t console:ci .
+
+      # Step 4: the release GATE. Verifies the build satisfies a signed policy, fully offline
+      # against a committed public key. Guarded so the workflow does not hard-fail before the
+      # one-time policy is authored + committed (see the doc). Once the two files below exist,
+      # this becomes a blocking gate.
+      - name: Verify gate (fail closed once policy exists)
+        run: |
+          POLICY=supply-chain/console-build.policy.signed.json
+          PUB=supply-chain/console-policy.pub
+          if [ ! -f "$POLICY" ] || [ ! -f "$PUB" ]; then
+            echo "::warning::No signed policy yet ($POLICY / $PUB). Skipping the gate."
+            echo "Author it once: see docs/supply-chain/cilock.md (cilock policy from-bundles -> sign -> commit)."
+            exit 0
+          fi
+          # Verify one of the built binaries against the policy. dist/ is goreleaser's output.
+          BIN=$(find dist -type f -name console | head -1)
+          cilock verify "$BIN" \
+            --policy "$POLICY" \
+            --publickey "$PUB" \
+            -a source-git.att.json -a build.att.json \
+            --platform-url "" \
+            --vsa-outfile console-build.vsa.json
+
+      - name: Upload attestations + VSA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cilock-attestations
+          path: |
+            source-git.att.json
+            build.att.json
+            console-build.vsa.json
+          if-no-files-found: ignore
