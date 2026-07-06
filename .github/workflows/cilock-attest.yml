@@ -64,7 +64,7 @@ jobs:
         run: |
           go install github.com/goreleaser/goreleaser/v2@latest
           cilock run --step build \
-            -a environment,git,slsa \
+            -a environment,git,github,slsa \
             -o build.att.json \
             --platform-url "${PLATFORM_URL}" --enable-archivista \
             --trace --hardening standard \
