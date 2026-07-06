@@ -61,6 +61,9 @@ jobs:
       # binaries (console + kc-agent) without publishing, so it is safe on a fork/tag.
       # No --trace: hermetic kernel tracing needs CAP_SYS_ADMIN, which GitHub-hosted runners
       # do not grant (curl/hugo omit it too). command-run still records argv/exit/stdout.
+      # --single-target: the full goreleaser matrix produces too many artifacts, overflowing
+      # Archivista's subject batch-insert (Postgres 65535-param limit). Platform bug filed;
+      # single-target keeps subjects under the limit until it is chunked server-side.
       - name: Attest build (step=build)
         run: |
           go install github.com/goreleaser/goreleaser/v2@latest
@@ -68,7 +71,7 @@ jobs:
             -a environment,git,github,slsa \
             -o build.att.json \
             --platform-url "${PLATFORM_URL}" --enable-archivista \
-            -- bash -c 'goreleaser build --snapshot --clean'
+            -- bash -c 'goreleaser build --snapshot --single-target --clean'
 
       # Step 3 (optional, uncomment once the image build runs here): attest the container image.
       # - name: Attest image (step=image)
